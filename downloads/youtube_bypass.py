@@ -87,8 +87,36 @@ class YouTubeBypassHelper:
             
         return opts
     
-    def extract_video_info_with_retry(self, url: str, max_retries: int = 5) -> Dict[str, Any]:
-        """Extract video info with multiple aggressive retry strategies to get all formats"""
+    def extract_video_info_with_retry(self, url: str, max_retries: int = 3) -> Dict[str, Any]:
+        """Extract video info with retry strategies - limited to 3 attempts to prevent infinite loops"""
+        
+        # Basic URL validation before attempting extraction
+        if not url or not url.strip():
+            raise ValueError("Empty URL provided")
+        
+        # Clean the URL
+        url = url.strip()
+        
+        # Basic URL format validation
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url if url.startswith(('http://', 'https://')) else f'https://{url}')
+            if not parsed.netloc:
+                raise ValueError("Invalid URL format")
+                
+            # Check for supported domains
+            hostname = parsed.netloc.lower()
+            supported_domains = [
+                'youtube.com', 'youtu.be', 'vimeo.com', 'tiktok.com', 
+                'twitch.tv', 'dailymotion.com', 'facebook.com', 'instagram.com'
+            ]
+            if not any(domain in hostname for domain in supported_domains):
+                raise ValueError(f"Unsupported domain: {hostname}")
+                
+        except Exception as e:
+            logger.error(f"URL validation failed for '{url}': {str(e)}")
+            raise ValueError(f"Invalid URL: {str(e)}")
+        
         strategies = [
             # Strategy 1: Web client with specific format extraction
             {
@@ -143,10 +171,10 @@ class YouTubeBypassHelper:
         
         for attempt in range(max_retries):
             try:
-                # Add delay between attempts
+                # Add delay between attempts (shorter for 3 attempts)
                 if attempt > 0:
-                    delay = random.uniform(3, 8) * (attempt + 1)
-                    logger.info(f"Retry attempt {attempt + 1} after {delay:.1f}s delay")
+                    delay = random.uniform(2, 5) * (attempt + 1)
+                    logger.info(f"Retry attempt {attempt + 1}/{max_retries} after {delay:.1f}s delay for URL: {url}")
                     time.sleep(delay)
                 
                 # Get base options
@@ -159,22 +187,33 @@ class YouTubeBypassHelper:
                     ydl_opts = self.get_base_ydl_opts()
                     ydl_opts['user_agent'] = self.get_random_user_agent()
                 
-                logger.info(f"Attempting extraction with strategy {attempt + 1}: {ydl_opts.get('extractor_args', {}).get('youtube', {}).get('player_client', ['default'])}")
+                logger.info(f"Attempting extraction with strategy {attempt + 1}/{max_retries}: {ydl_opts.get('extractor_args', {}).get('youtube', {}).get('player_client', ['default'])}")
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     
                     if info:
-                        logger.info(f"Successfully extracted video info on attempt {attempt + 1}")
+                        logger.info(f"Successfully extracted video info on attempt {attempt + 1}/{max_retries}")
                         return info
                     
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                error_message = str(e)
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for URL {url}: {error_message}")
+                
+                # Check for specific invalid URL errors that shouldn't be retried
+                if any(phrase in error_message.lower() for phrase in [
+                    'is not a valid url', 'unsupported url', 'invalid url', 
+                    'no video found', 'video unavailable', 'private video'
+                ]):
+                    logger.error(f"URL validation failed, stopping retries: {error_message}")
+                    raise ValueError(f"Invalid or unsupported URL: {error_message}")
+                    
                 if attempt == max_retries - 1:
                     logger.error(f"All {max_retries} attempts failed for URL: {url}")
-                    raise e
+                    raise Exception(f"Failed to extract video info after {max_retries} attempts: {error_message}")
         
-        return None
+        logger.error(f"No video info extracted after {max_retries} attempts for URL: {url}")
+        raise Exception(f"Failed to extract video information after {max_retries} attempts")
     
     def download_with_fallback(self, url: str, ydl_opts: Dict[str, Any]) -> bool:
         """Download with fallback strategies"""

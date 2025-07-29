@@ -228,20 +228,24 @@ def get_direct_urls(request):
         )
     
     try:
-        # Use iOS client to get direct URLs
-        ios_opts = {
+        # Use TV client to get direct URLs for downloadable files
+        # TV client has excellent format availability including audio-only formats like 140
+        tv_opts = {
             'quiet': True,
             'skip_download': True,
-            'format': format_id or 'bestvideo[height>=1080][height<1440]+bestaudio/best[height>=1080][height<1440]',
+            'format': format_id or 'bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio[acodec!=none]/bestaudio',  # Prioritize M4A audio for direct downloads
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios'],
+                    'player_client': ['tv'],  # TV client for best format availability including M4A
                 }
             },
+            # Prefer downloadable formats over streaming
+            'prefer_free_formats': False,  # We want quality, not just free formats
+            'format_sort': ['ext:m4a', 'ext:aac', 'ext:mp3', 'acodec', '+size', '+br', '+res', '+fps', 'proto:https', 'proto:http'],
         }
         
         import yt_dlp
-        with yt_dlp.YoutubeDL(ios_opts) as ydl:
+        with yt_dlp.YoutubeDL(tv_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         
         title = info.get('title', 'Unknown Title')
@@ -251,21 +255,36 @@ def get_direct_urls(request):
         requested_formats = info.get('requested_formats', [])
         
         if direct_url:
-            # Single direct URL (simple format)
+            # Single direct URL - but we need to proxy it due to CORS
+            # Create a proxy download URL through our backend
+            import urllib.parse
+            
+            # Encode the direct URL and other parameters for our proxy endpoint
+            proxy_params = {
+                'direct_url': direct_url,
+                'filename': f"{title}.{info.get('ext', 'mp4')}",
+                'ext': info.get('ext', 'mp4'),
+                'filesize': info.get('filesize') or info.get('filesize_approx', 0)
+            }
+            
+            # Create proxy URL that will download via our backend
+            proxy_url = f"/api/downloads/proxy-download/?{urllib.parse.urlencode(proxy_params)}"
+            
             return Response({
                 'type': 'single_url',
                 'direct_urls': [
                     {
                         'type': 'single',
-                        'url': direct_url,
+                        'url': proxy_url,  # Use our proxy URL instead of direct googlevideo URL
                         'filename': f"{title}.{info.get('ext', 'mp4')}",
                         'resolution': f"{info.get('width', 'unknown')}x{info.get('height', 'unknown')}",
                         'ext': info.get('ext', 'mp4'),
-                        'filesize': info.get('filesize') or info.get('filesize_approx')
+                        'filesize': info.get('filesize') or info.get('filesize_approx'),
+                        'original_url': direct_url  # Keep the original for debugging
                     }
                 ],
                 'title': title,
-                'message': 'Single direct download URL - client can download directly from YouTube'
+                'message': 'Proxied download URL - bypasses CORS via backend streaming'
             })
             
         elif requested_formats:
@@ -323,8 +342,6 @@ def get_direct_urls(request):
 @permission_classes([permissions.AllowAny])
 def stream_download(request):
     """Stream download directly to user using yt-dlp with enhanced progress tracking"""
-    print("🚀🚀🚀 STREAM_DOWNLOAD FUNCTION CALLED! 🚀🚀🚀")
-    print(f"Request method: {request.method}")
     # Handle both GET and POST requests
     if request.method == 'GET':
         url = request.GET.get('url')
@@ -346,13 +363,7 @@ def stream_download(request):
         download_id = request.data.get('download_id')
         
         # DEBUG: Print what we received - CLEAN
-        print(f"====== STREAM DOWNLOAD DEBUG ======")
-        print(f"METHOD: {request.method}")
-        print(f"URL: {url}")
-        print(f"download_id: {download_id}")
-        print(f"format_id: {format_id}")
-        print(f"quality: {quality}")
-        print(f"====== END DEBUG ======")
+        logger.info(f"Stream download request - URL: {url}, Format: {format_id}")
     
     if not url:
         return Response({'error': 'URL is required'}, status=400)
@@ -373,29 +384,18 @@ def stream_download(request):
         # Progress tracking setup - use dedicated download progress key
         progress_key = f"download_progress_{download_id}" if download_id else None
         
-        print(f"🔧 Progress key: {progress_key}")  # Clean debug
-        
         # Set initial progress and clear any existing progress data
         if progress_key:
-            # Clear any existing progress data first
-            existing_data = cache.get(progress_key)
-            print(f"🔍 BEFORE CLEAR - Existing cache data: {existing_data}")
             cache.delete(progress_key)
-            
             progress_data = {
                 'progress': 0,
                 'message': "Starting download...",
                 'status': 'downloading'
             }
             cache.set(progress_key, progress_data, 300)  # Cache for 5 minutes
-            
-            # Verify what we just set
-            verification = cache.get(progress_key)
-            print(f"🔍 AFTER SET - Cache verification: {verification}")
-            print(f"✅ Initial progress set: 0% - Starting download...")  # Clean log
         
         def update_download_progress(percentage, message=""):
-            """Update download progress in cache - clean and simple"""
+            """Update download progress in cache"""
             if progress_key:
                 progress_data = {
                     'progress': percentage,
@@ -403,41 +403,28 @@ def stream_download(request):
                     'status': 'downloading'
                 }
                 cache.set(progress_key, progress_data, 300)  # Cache for 5 minutes
-                
-                # Enhanced debugging with timestamp for frontend tracking
-                current_time = timezone.now().strftime("%H:%M:%S.%f")[:-3]
-                print(f"[{current_time}] CACHE UPDATE - Key: {progress_key}, Progress: {percentage}%, Message: {message}")
-                
-                # Verify cache write
-                verification = cache.get(progress_key)
-                if verification and verification.get('progress') == percentage:
-                    print(f"[{current_time}] CACHE VERIFIED - Successfully stored {percentage}%")
-                else:
-                    print(f"[{current_time}] CACHE ERROR - Failed to store progress! Got: {verification}")
-            else:
-                print(f"❌ No progress key - {percentage}% - {message}")
         
         # Define progress hook for yt-dlp
         def progress_hook(d):
-            print(f"🔄 YT-DLP PROGRESS HOOK CALLED - Status: {d.get('status', 'unknown')}")
+            # Check for cancellation first
+            if progress_key:
+                cancel_key = f"download_cancel_{download_id}"
+                is_cancelled = cache.get(cancel_key)
+                if is_cancelled:
+                    logger.info(f"Download {download_id} cancelled during progress hook")
+                    # This will cause yt-dlp to stop - we raise an exception to interrupt
+                    raise Exception("Download cancelled by user")
             
             if d['status'] == 'downloading' and progress_key:
-                print(f"🔄 Processing downloading status...")
-                
-                # Check what yt-dlp is actually sending us
                 downloaded = d.get('downloaded_bytes', 0)
                 total_bytes = d.get('total_bytes', 0)
                 total_estimate = d.get('total_bytes_estimate', 0)
                 
-                print(f"� YT-DLP DATA: downloaded={downloaded}, total_bytes={total_bytes}, total_estimate={total_estimate}")
-                
                 if total_estimate > 0 and total_estimate < 50000:  # Less than 50KB is likely metadata
-                    print(f"⏭️ Skipping metadata file: {total_estimate} bytes")
                     return
                 
                 if total_bytes > 0:
                     progress = int((downloaded / total_bytes) * 100)
-
                     speed = d.get('speed', 0)
                     if speed:
                         speed_mb = speed / 1024 / 1024
@@ -446,7 +433,6 @@ def stream_download(request):
                         update_download_progress(progress, "Downloading...")
                 elif total_estimate > 0:
                     progress = int((downloaded / total_estimate) * 100)
-
                     update_download_progress(progress, "Downloading...")
                 else:
                     # If no size info, report unknown progress
@@ -605,17 +591,19 @@ def stream_download(request):
                 # Initialize progress
                 if progress_key:
                     update_download_progress(5, "Initializing download...")
-                    print(f"Progress tracking initialized for: {download_id}")  # Debug log
+                
+                # Check for cancellation before starting download
+                if progress_key:
+                    cancel_key = f"download_cancel_{download_id}"
+                    is_cancelled = cache.get(cancel_key)
+                    if is_cancelled:
+                        logger.info(f"Download {download_id} cancelled before starting")
+                        raise Exception("Download cancelled by user")
                 
                 try:
-                    # Use yt-dlp directly with iOS client - don't use bypass helper download methods
-                    # since they override our iOS client setting
-                    print(f"🔥🔥🔥 ABOUT TO START YT-DLP DOWNLOAD 🔥🔥🔥")
-                    print(f"ydl_opts has progress_hooks: {'progress_hooks' in ydl_opts}")
-                    print(f"Number of progress hooks: {len(ydl_opts.get('progress_hooks', []))}")
+                    # Use yt-dlp directly with iOS client
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         download_result = ydl.download([url])
-                        print(f"🔥🔥🔥 YT-DLP DOWNLOAD FINISHED 🔥🔥🔥")
                         logger.info(f"iOS client download successful: {download_result}")
                         
                 except Exception as download_error:
@@ -659,6 +647,10 @@ def stream_download(request):
                 
                 downloaded_file_path = os.path.join(temp_dir, downloaded_files[0])
                 logger.info(f"Download completed: {downloaded_file_path}")
+                
+                # Final progress update - file is ready for download
+                if progress_key:
+                    update_download_progress(100, f"Downloaded: {filename}")
                 
                 # Note: Don't set progress to 100% here as it conflicts with real yt-dlp progress
                 # The yt-dlp 'finished' hook will handle the final progress update
@@ -739,14 +731,9 @@ def get_download_progress(request, download_id):
     progress_key = f"download_progress_{download_id}"  # Use dedicated download progress key
     progress_data = cache.get(progress_key)
     
-    # Enhanced debugging for frontend
-    current_time = timezone.now().strftime("%H:%M:%S.%f")[:-3]
-    
     if progress_data:
-        print(f"[{current_time}] PROGRESS API CALL - ID: {download_id}, Progress: {progress_data.get('progress', 0)}%, Message: {progress_data.get('message', 'N/A')}")
         return Response(progress_data)
     else:
-        print(f"[{current_time}] PROGRESS API CALL - ID: {download_id}, NO DATA FOUND")
         # Return a more informative default response
         default_response = {
             'progress': 0,
@@ -754,6 +741,184 @@ def get_download_progress(request, download_id):
             'status': 'unknown'
         }
         return Response(default_response)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def cancel_download(request):
+    """Cancel an active download"""
+    download_id = request.data.get('download_id')
+    
+    if not download_id:
+        return Response(
+            {'error': 'download_id is required'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        from django.core.cache import cache
+        import os
+        
+        # 1. Mark the download as cancelled in cache
+        progress_key = f"download_progress_{download_id}"
+        cancel_key = f"download_cancel_{download_id}"
+        
+        # Set cancellation flag
+        cache.set(cancel_key, True, 300)  # Cache for 5 minutes
+        
+        # Update progress to show cancellation
+        cancel_progress = {
+            'progress': 0,
+            'message': 'Download cancelled by user',
+            'status': 'cancelled'
+        }
+        cache.set(progress_key, cancel_progress, 300)
+        
+        logger.info(f"Download {download_id} marked for cancellation")
+        
+        # 2. Try to clean up any temporary files for this download
+        # Note: The actual yt-dlp process cancellation will be handled by the AbortController
+        # on the frontend, which will close the HTTP connection
+        try:
+            import tempfile
+            import glob
+            
+            # Look for temp directories that might be related to this download
+            temp_base = tempfile.gettempdir()
+            possible_temp_dirs = glob.glob(os.path.join(temp_base, f"*{download_id}*"))
+            
+            for temp_dir in possible_temp_dirs:
+                if os.path.isdir(temp_dir):
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"Cleaned up temp directory: {temp_dir}")
+                    
+        except Exception as cleanup_error:
+            logger.warning(f"Could not clean up temp files for {download_id}: {cleanup_error}")
+        
+        return Response({
+            'message': f'Download {download_id} cancellation requested',
+            'status': 'cancelled'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error cancelling download {download_id}: {str(e)}")
+        return Response({
+            'error': f'Failed to cancel download: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def get_download_progress(request, download_id):
+    """Get real-time download progress"""
+    from django.core.cache import cache
+    
+    progress_key = f"download_progress_{download_id}"  # Use dedicated download progress key
+    progress_data = cache.get(progress_key)
+    
+    if progress_data:
+        return Response(progress_data)
+    else:
+        # Return a more informative default response
+        default_response = {
+            'progress': 0,
+            'message': 'No progress data available',
+            'status': 'unknown'
+        }
+        return Response(default_response)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def proxy_download(request):
+    """Proxy download from direct URLs to bypass CORS restrictions"""
+    direct_url = request.GET.get('direct_url')
+    filename = request.GET.get('filename', 'download.mp4')
+    ext = request.GET.get('ext', 'mp4')
+    filesize = request.GET.get('filesize', 0)
+    
+    if not direct_url:
+        return Response(
+            {'error': 'direct_url parameter is required'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        import requests
+        from django.http import StreamingHttpResponse
+        
+        # Set up headers to mimic a browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'audio/mp4,audio/*,*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity',  # Don't use gzip to avoid decompression issues
+            'Range': 'bytes=0-',  # Request full file
+            'Connection': 'keep-alive'
+        }
+        
+        # Make the request to the direct URL
+        logger.info(f"Proxying download: {filename}")
+        
+        response = requests.get(direct_url, headers=headers, stream=True, timeout=30)
+        
+        if not response.ok:
+            logger.error(f"Failed to fetch from direct URL: {response.status_code}")
+            return Response(
+                {'error': f'Failed to fetch file: {response.status_code} {response.reason}'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create streaming response
+        def file_iterator():
+            try:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            except Exception as e:
+                logger.error(f"Error streaming file: {str(e)}")
+                # If streaming fails, we can't recover gracefully
+                pass
+            finally:
+                response.close()
+        
+        # Create the streaming response with proper download headers
+        streaming_response = StreamingHttpResponse(
+            file_iterator(),
+            content_type='application/octet-stream'
+        )
+        
+        # Set download headers
+        streaming_response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        
+        # Set content length if we have it
+        content_length = response.headers.get('Content-Length')
+        if content_length:
+            streaming_response['Content-Length'] = content_length
+        elif filesize and int(filesize) > 0:
+            streaming_response['Content-Length'] = str(filesize)
+        
+        # Add CORS headers for frontend
+        streaming_response['Access-Control-Allow-Origin'] = '*'
+        streaming_response['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        streaming_response['Access-Control-Allow-Headers'] = 'Content-Type'
+        
+        logger.info(f"Started proxy download for: {filename}")
+        return streaming_response
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error in proxy download: {str(e)}")
+        return Response(
+            {'error': f'Network error: {str(e)}'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    except Exception as e:
+        logger.error(f"Error in proxy download: {str(e)}")
+        return Response(
+            {'error': f'Proxy download failed: {str(e)}'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(['POST'])

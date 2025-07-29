@@ -12,8 +12,10 @@ urlpatterns = [
     path('video-info-progress/', views.get_video_info_with_progress, name='get_video_info_with_progress'),
     path('progress/<str:task_id>/', views.get_progress, name='get_progress'),
     path('download-progress/<str:download_id>/', views.get_download_progress, name='get_download_progress'),
+    path('cancel-download/', views.cancel_download, name='cancel_download'),  # NEW: Cancel active downloads
     path('direct-download/', views.get_direct_download_url, name='get_direct_download_url'),
     path('direct-urls/', views.get_direct_urls, name='get_direct_urls'),  # NEW: True direct URLs
+    path('proxy-download/', views.proxy_download, name='proxy_download'),  # NEW: Proxy for CORS bypass
     path('stream/', views.stream_download, name='stream_download'),
     path('test/', views.test_download_page, name='test_download_page'),
     path('', include(router.urls)),

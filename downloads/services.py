@@ -193,17 +193,39 @@ class DownloadService:
             ]
             
             # Only add smart selectors for qualities we actually have video for
-            video_heights = set(f.get('height', 0) for f in video_only)
-            max_available_height = max(video_heights) if video_heights else 0
+            # For vertical videos, we need to check the width (smaller dimension) instead of height
+            video_qualities = []
+            for f in video_only:
+                width = f.get('width', 0)
+                height = f.get('height', 0)
+                if width > 0 and height > 0:
+                    # For vertical videos (height > width), the "quality" is based on width
+                    # For horizontal videos, the quality is based on height
+                    effective_quality = min(width, height) if height > width else height
+                    video_qualities.append(effective_quality)
             
-            logger.info(f"Max available video height: {max_available_height}")
+            video_qualities = set(video_qualities)
+            max_available_quality = max(video_qualities) if video_qualities else 0
+            
+            logger.info(f"Available video qualities (effective resolution): {sorted(video_qualities)}")
+            logger.info(f"Max available video quality: {max_available_quality}")
             
             for selector in smart_selectors:
-                # Check if we have video at this quality level and don't already have combined format
-                has_video_at_height = any(f.get('height', 0) >= selector['min_height'] for f in video_only)
+                # Only add if we have video at or near this resolution
+                selector_height = selector['height']
+                min_height = selector['min_height']
+                
+                # FIXED: Check effective quality (min dimension for vertical, height for horizontal)
+                # This prevents adding 1440p for 1080x1920 vertical videos
+                has_compatible_video = (
+                    min_height <= max_available_quality and 
+                    max_available_quality >= min_height
+                )
                 existing_quality = any(fmt['quality'] == selector['quality'] for fmt in available_formats)
                 
-                if has_video_at_height and not existing_quality:
+                logger.info(f"Checking {selector['quality']} ({selector_height}p): max_available_quality={max_available_quality}, min_height={min_height}, has_compatible={has_compatible_video}, existing={existing_quality}")
+                
+                if has_compatible_video and not existing_quality:
                     available_formats.append({
                         'quality': selector['quality'],
                         'label': f"{selector['quality']} - {selector['width']}x{selector['height']}",
@@ -221,6 +243,8 @@ class DownloadService:
                         'resolution': f"{selector['width']}x{selector['height']}"
                     })
                     logger.info(f"Added working iOS smart selector: {selector['quality']} - {selector['format_id']}")
+                else:
+                    logger.info(f"Skipped {selector['quality']}: not compatible with available video formats")
             
             # Add general fallback if no high quality formats were added
             if not any(fmt.get('height', 0) >= 720 for fmt in available_formats):
